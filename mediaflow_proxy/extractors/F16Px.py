@@ -42,7 +42,7 @@ class F16PxExtractor(BaseExtractor):
         headers = self.base_headers.copy()
         headers["referer"] = f"https://{host}/"
 
-        resp = await self._make_request(api_url, headers=headers)
+        resp = await self._make_request(api_url, method="POST", headers=headers)
         try:
             data = resp.json()
         except Exception:
