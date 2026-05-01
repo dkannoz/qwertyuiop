@@ -22,3 +22,6 @@ anyio
 telethon
 av
 aiohttp
+cloudscraper
+brotli
+aiohttp-socks
