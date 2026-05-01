@@ -135,23 +135,59 @@ class UnpackingError(Exception):
     pass
 
 
+def _match_packed(html: str, base_url: str, patterns: list[str]) -> str | None:
+    """Find a p.a.c.k.e.d JS block in *html* and return the first matching pattern."""
+    soup = BeautifulSoup(html, "lxml", parse_only=SoupStrainer("script"))
+    for script in soup.find_all("script"):
+        text = script.text or ""
+        if not detect(text):
+            continue
+        unpacked_code = unpack(text)
+        for pattern in patterns:
+            match = re.search(pattern, unpacked_code)
+            if match:
+                extracted_url = match.group(1)
+                if not urlparse(extracted_url).scheme:
+                    extracted_url = urljoin(base_url, extracted_url)
+                return extracted_url
+    return None
+
+
 async def eval_solver(self, url: str, headers: dict[str, str] | None, patterns: list[str]) -> str:
+    """Resolve a URL by unpacking p.a.c.k.e.d JS, with optional Byparr fallback.
+
+    Order:
+    1. Direct request via self._make_request (fast path).
+    2. If BYPARR_URL is set: fetch through Byparr and retry the match.
+    """
+    from mediaflow_proxy.configs import settings
+
+    primary_exc: Exception | None = None
+
+    # 1. Direct request
     try:
         response = await self._make_request(url, headers=headers)
-        soup = BeautifulSoup(response.text, "lxml", parse_only=SoupStrainer("script"))
-        script_all = soup.find_all("script")
-        for i in script_all:
-            if detect(i.text):
-                unpacked_code = unpack(i.text)
-                for pattern in patterns:
-                    match = re.search(pattern, unpacked_code)
-                    if match:
-                        extracted_url = match.group(1)
-                        if not urlparse(extracted_url).scheme:
-                            extracted_url = urljoin(url, extracted_url)
-
-                        return extracted_url
-        raise UnpackingError("No p.a.c.k.e.d JS found or no pattern matched.")
+        result = _match_packed(response.text, url, patterns)
+        if result:
+            return result
+        primary_exc = UnpackingError("No p.a.c.k.e.d JS / pattern not matched in direct response")
     except Exception as e:
-        logger.exception("Eval solver error for %s", url)
-        raise UnpackingError("Error in eval_solver") from e
+        primary_exc = e
+
+    # 2. Byparr fallback
+    if settings.byparr_url:
+        from mediaflow_proxy.utils.byparr import fetch_via_byparr, ByparrError
+
+        try:
+            html = await fetch_via_byparr(url)
+            result = _match_packed(html, url, patterns)
+            if result:
+                logger.info("eval_solver: Byparr fallback succeeded for %s", url)
+                return result
+            logger.warning("eval_solver: Byparr fetched %s but no pattern matched", url)
+        except ByparrError as e:
+            logger.warning("eval_solver: Byparr fallback failed for %s: %s", url, e)
+            primary_exc = e
+
+    logger.error("Eval solver failed for %s: %s", url, primary_exc)
+    raise UnpackingError("Error in eval_solver") from primary_exc
