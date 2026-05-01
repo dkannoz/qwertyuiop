@@ -4,6 +4,7 @@ import sys
 from contextlib import asynccontextmanager
 from importlib import resources
 
+import aiohttp
 from fastapi import FastAPI, Depends, Security, HTTPException
 from fastapi.security import APIKeyQuery, APIKeyHeader
 from starlette.middleware.cors import CORSMiddleware
@@ -44,6 +45,27 @@ def _filtered_unraisable_hook(unraisable):
 sys.unraisablehook = _filtered_unraisable_hook
 
 
+async def _byparr_keepalive():
+    """Periodically GET Byparr's /docs to keep its free-tier instance awake.
+
+    Why: free-tier Render services sleep after 15 min idle. The first request
+    after sleep takes ~30-40 s to wake Byparr's Camoufox runtime, which can
+    exceed BYPARR_TIMEOUT and cause spurious extractor failures.
+    """
+    interval_s = 600
+    target = f"{settings.byparr_url.rstrip('/')}/docs"
+    timeout = aiohttp.ClientTimeout(total=15)
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(target) as resp:
+                    logger.info("Byparr keepalive: GET %s -> %s", target, resp.status)
+        except Exception as e:
+            logger.warning("Byparr keepalive failed: %s", e)
+        await asyncio.sleep(interval_s)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler for startup and shutdown events."""
@@ -55,10 +77,21 @@ async def lifespan(app: FastAPI):
         # use redis-cli KEYS "mfp:*" | xargs redis-cli DEL
         logger.info("Cache clearing note: Redis entries will expire via TTL")
 
+    keepalive_task: asyncio.Task | None = None
+    if settings.byparr_url:
+        keepalive_task = asyncio.create_task(_byparr_keepalive())
+        logger.info("Byparr keepalive task started for %s", settings.byparr_url)
+
     yield
 
     # Shutdown
     logger.info("Shutting down...")
+    if keepalive_task is not None:
+        keepalive_task.cancel()
+        try:
+            await keepalive_task
+        except asyncio.CancelledError:
+            pass
     # Close acestream sessions
     if settings.enable_acestream:
         from mediaflow_proxy.utils.acestream import acestream_manager

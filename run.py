@@ -1,11 +1,12 @@
 from fastapi import FastAPI
-from mediaflow_proxy.main import app as mediaflow_app  # Import mediaflow app
+from mediaflow_proxy.main import app as mediaflow_app, lifespan  # Import mediaflow app and its lifespan
 import httpx
 import re
 import string
 
-# Initialize the main FastAPI application
-main_app = FastAPI()
+# Initialize the main FastAPI application — reuse mediaflow's lifespan so
+# startup/shutdown hooks (Byparr keepalive, Redis close, etc.) run.
+main_app = FastAPI(lifespan=lifespan)
 
 # Manually add only non-static routes from mediaflow_app
 for route in mediaflow_app.routes:
