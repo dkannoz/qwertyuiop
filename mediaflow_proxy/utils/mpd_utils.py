@@ -1,6 +1,8 @@
 import logging
 import math
 import re
+import statistics
+import struct
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Union
 from urllib.parse import urljoin
@@ -8,6 +10,35 @@ from urllib.parse import urljoin
 import xmltodict
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_url(base_url: str, relative_url: str) -> str:
+    """
+    Resolve a relative URL against a base URL.
+
+    Handles three cases:
+    1. Absolute URL (starts with http:// or https://) - return as-is
+    2. Absolute path (starts with /) - resolve against origin (scheme + host)
+    3. Relative path - resolve against base URL directory
+
+    Args:
+        base_url: The base URL (typically the MPD URL)
+        relative_url: The URL to resolve
+
+    Returns:
+        The resolved absolute URL
+    """
+    if not relative_url:
+        return base_url
+
+    # Already absolute URL
+    if relative_url.startswith(("http://", "https://")):
+        return relative_url
+
+    # Use urljoin which correctly handles:
+    # - Absolute paths (starting with /) -> resolves against origin
+    # - Relative paths -> resolves against base URL
+    return urljoin(base_url, relative_url)
 
 
 def parse_mpd(mpd_content: Union[str, bytes]) -> dict:
@@ -43,7 +74,6 @@ def parse_mpd_dict(
     """
     profiles = []
     parsed_dict = {}
-    source = "/".join(mpd_url.split("/")[:-1])
 
     is_live = mpd_dict["MPD"].get("@type", "static").lower() == "dynamic"
     parsed_dict["isLive"] = is_live
@@ -66,7 +96,10 @@ def parse_mpd_dict(
 
     for period in periods:
         parsed_dict["PeriodStart"] = parse_duration(period.get("@start", "PT0S"))
-        for adaptation in period["AdaptationSet"]:
+        adaptation_sets = period["AdaptationSet"]
+        adaptation_sets = adaptation_sets if isinstance(adaptation_sets, list) else [adaptation_sets]
+
+        for adaptation in adaptation_sets:
             representations = adaptation["Representation"]
             representations = representations if isinstance(representations, list) else [representations]
 
@@ -75,7 +108,7 @@ def parse_mpd_dict(
                     parsed_dict,
                     representation,
                     adaptation,
-                    source,
+                    mpd_url,
                     media_presentation_duration,
                     parse_segment_profile_id,
                 )
@@ -195,7 +228,7 @@ def parse_representation(
     parsed_dict: dict,
     representation: dict,
     adaptation: dict,
-    source: str,
+    mpd_url: str,
     media_presentation_duration: str,
     parse_segment_profile_id: Optional[str],
 ) -> Optional[dict]:
@@ -206,7 +239,7 @@ def parse_representation(
         parsed_dict (dict): The parsed MPD data.
         representation (dict): The representation data.
         adaptation (dict): The adaptation set data.
-        source (str): The source URL.
+        mpd_url (str): The URL of the MPD manifest.
         media_presentation_duration (str): The media presentation duration.
         parse_segment_profile_id (str, optional): The profile ID to parse segments for. Defaults to None.
 
@@ -219,12 +252,22 @@ def parse_representation(
     if "video" not in mime_type and "audio" not in mime_type:
         return None
 
+    # Raw rep.id from XML — used for $RepresentationID$ URL template expansion.
+    rep_id = representation.get("@id") or adaptation.get("@id") or "0"
+    adapt_id = adaptation.get("@id") or "0"
+    bandwidth_for_id = int(representation.get("@bandwidth") or adaptation.get("@bandwidth") or 0)
+    # Globally unique profile ID: "{adapt_id}_{rep_id}_{bandwidth}".
+    # Within one AdaptationSet multiple representations can share the same @id
+    # (same quality tier, different codec variant), so we include bandwidth to distinguish.
+    unique_id = f"{adapt_id}_{rep_id}_{bandwidth_for_id}"
+
     profile = {
-        "id": representation.get("@id") or adaptation.get("@id"),
+        "id": unique_id,
+        "rep_id": rep_id,  # raw XML @id for $RepresentationID$ template expansion
         "mimeType": mime_type,
         "lang": representation.get("@lang") or adaptation.get("@lang"),
         "codecs": representation.get("@codecs") or adaptation.get("@codecs"),
-        "bandwidth": int(representation.get("@bandwidth") or adaptation.get("@bandwidth")),
+        "bandwidth": bandwidth_for_id,
         "startWithSAP": (_get_key(adaptation, representation, "@startWithSAP") or "1") == "1",
         "mediaPresentationDuration": media_presentation_duration,
     }
@@ -256,21 +299,63 @@ def parse_representation(
     # Extract segment template start number for adaptive sequence calculation
     segment_template_data = adaptation.get("SegmentTemplate") or representation.get("SegmentTemplate")
     if segment_template_data:
+        profile["segment_template_start_number_explicit"] = "@startNumber" in segment_template_data
         try:
             profile["segment_template_start_number"] = int(segment_template_data.get("@startNumber", 1))
         except (ValueError, TypeError):
             profile["segment_template_start_number"] = 1
+        try:
+            profile["segment_template_timescale"] = int(segment_template_data.get("@timescale", 1))
+        except (ValueError, TypeError):
+            profile["segment_template_timescale"] = 1
     else:
         profile["segment_template_start_number"] = 1
+        profile["segment_template_start_number_explicit"] = False
+
+    # For SegmentBase profiles, we need to set initUrl even when not parsing segments
+    # This is needed for the HLS playlist builder to reference the init URL
+    segment_base_data = representation.get("SegmentBase")
+    if segment_base_data and "initUrl" not in profile:
+        base_url = representation.get("BaseURL", "")
+        profile["initUrl"] = resolve_url(mpd_url, base_url)
+
+        # Store initialization range if available
+        if "Initialization" in segment_base_data:
+            init_range = segment_base_data["Initialization"].get("@range")
+            if init_range:
+                profile["initRange"] = init_range
+
+    # For SegmentList profiles, we also need to set initUrl even when not parsing segments
+    segment_list_data = representation.get("SegmentList") or adaptation.get("SegmentList")
+    if segment_list_data and "initUrl" not in profile:
+        if "Initialization" in segment_list_data:
+            init_data = segment_list_data["Initialization"]
+            if "@sourceURL" in init_data:
+                init_url = init_data["@sourceURL"]
+                profile["initUrl"] = resolve_url(mpd_url, init_url)
+            elif "@range" in init_data:
+                base_url = representation.get("BaseURL", "")
+                profile["initUrl"] = resolve_url(mpd_url, base_url)
+                profile["initRange"] = init_data["@range"]
 
     if parse_segment_profile_id is None or profile["id"] != parse_segment_profile_id:
         return profile
 
-    item = adaptation.get("SegmentTemplate") or representation.get("SegmentTemplate")
-    if item:
-        profile["segments"] = parse_segment_template(parsed_dict, item, profile, source)
+    # Parse segments based on the addressing scheme used
+    segment_template = adaptation.get("SegmentTemplate") or representation.get("SegmentTemplate")
+    segment_list = adaptation.get("SegmentList") or representation.get("SegmentList")
+
+    # Get BaseURL from representation (can be relative path like "a/b/c/")
+    base_url = representation.get("BaseURL", "")
+
+    if segment_template:
+        profile["segments"] = parse_segment_template(parsed_dict, segment_template, profile, mpd_url, base_url)
+    elif segment_list:
+        # Get timescale from SegmentList or default to 1
+        timescale = int(segment_list.get("@timescale", 1))
+        profile["segments"] = parse_segment_list(adaptation, representation, profile, mpd_url, timescale)
     else:
-        profile["segments"] = parse_segment_base(representation, profile, source)
+        profile["segments"] = parse_segment_base(representation, profile, mpd_url)
 
     return profile
 
@@ -290,7 +375,9 @@ def _get_key(adaptation: dict, representation: dict, key: str) -> Optional[str]:
     return representation.get(key, adaptation.get(key, None))
 
 
-def parse_segment_template(parsed_dict: dict, item: dict, profile: dict, source: str) -> List[Dict]:
+def parse_segment_template(
+    parsed_dict: dict, item: dict, profile: dict, mpd_url: str, base_url: str = ""
+) -> List[Dict]:
     """
     Parses a segment template and extracts segment information.
 
@@ -298,33 +385,49 @@ def parse_segment_template(parsed_dict: dict, item: dict, profile: dict, source:
         parsed_dict (dict): The parsed MPD data.
         item (dict): The segment template data.
         profile (dict): The profile information.
-        source (str): The source URL.
+        mpd_url (str): The URL of the MPD manifest.
+        base_url (str): The BaseURL from the representation (optional, for per-representation paths).
 
     Returns:
         List[Dict]: The list of parsed segments.
     """
     segments = []
     timescale = int(item.get("@timescale", 1))
+    profile["segment_template_timescale"] = timescale
+    profile["segment_template_start_number_explicit"] = "@startNumber" in item
+    try:
+        profile["segment_template_start_number"] = int(
+            item.get("@startNumber", profile.get("segment_template_start_number", 1))
+        )
+    except (ValueError, TypeError):
+        profile["segment_template_start_number"] = 1
 
     # Initialization
     if "@initialization" in item:
         media = item["@initialization"]
-        media = media.replace("$RepresentationID$", profile["id"])
+        media = media.replace("$RepresentationID$", profile.get("rep_id", profile["id"]))
         media = media.replace("$Bandwidth$", str(profile["bandwidth"]))
-        if not media.startswith("http"):
-            media = f"{source}/{media}"
-        profile["initUrl"] = media
+        # Combine base_url and media, then resolve against mpd_url
+        if base_url:
+            media = base_url + media
+        profile["initUrl"] = resolve_url(mpd_url, media)
 
     # Segments
     if "SegmentTimeline" in item:
-        segments.extend(parse_segment_timeline(parsed_dict, item, profile, source, timescale))
+        segments.extend(parse_segment_timeline(parsed_dict, item, profile, mpd_url, timescale, base_url))
     elif "@duration" in item:
-        segments.extend(parse_segment_duration(parsed_dict, item, profile, source, timescale))
+        try:
+            profile["nominal_duration_mpd_timescale"] = int(item["@duration"])
+        except (ValueError, TypeError):
+            pass
+        segments.extend(parse_segment_duration(parsed_dict, item, profile, mpd_url, timescale, base_url))
 
     return segments
 
 
-def parse_segment_timeline(parsed_dict: dict, item: dict, profile: dict, source: str, timescale: int) -> List[Dict]:
+def parse_segment_timeline(
+    parsed_dict: dict, item: dict, profile: dict, mpd_url: str, timescale: int, base_url: str = ""
+) -> List[Dict]:
     """
     Parses a segment timeline and extracts segment information.
 
@@ -332,8 +435,9 @@ def parse_segment_timeline(parsed_dict: dict, item: dict, profile: dict, source:
         parsed_dict (dict): The parsed MPD data.
         item (dict): The segment timeline data.
         profile (dict): The profile information.
-        source (str): The source URL.
+        mpd_url (str): The URL of the MPD manifest.
         timescale (int): The timescale for the segments.
+        base_url (str): The BaseURL from the representation (optional, for per-representation paths).
 
     Returns:
         List[Dict]: The list of parsed segments.
@@ -346,11 +450,34 @@ def parse_segment_timeline(parsed_dict: dict, item: dict, profile: dict, source:
     presentation_time_offset = int(item.get("@presentationTimeOffset", 0))
     start_number = int(item.get("@startNumber", 1))
 
+    timeline_segments = preprocess_timeline(timelines, start_number, period_start, presentation_time_offset, timescale)
+
+    nominal_duration = _resolve_nominal_timeline_duration(timeline_segments)
+    if nominal_duration:
+        profile["nominal_duration_mpd_timescale"] = nominal_duration
+
     segments = [
-        create_segment_data(timeline, item, profile, source, timescale)
-        for timeline in preprocess_timeline(timelines, start_number, period_start, presentation_time_offset, timescale)
+        create_segment_data(timeline, item, profile, mpd_url, timescale, base_url) for timeline in timeline_segments
     ]
     return segments
+
+
+def _resolve_nominal_timeline_duration(timeline_segments: List[Dict]) -> Optional[int]:
+    """
+    Resolve a stable nominal segment duration from expanded SegmentTimeline entries.
+
+    Live timelines often contain occasional shorter segments; using median keeps
+    sequence calculations stable when the window slides.
+    """
+    durations = []
+    for segment in timeline_segments:
+        duration = segment.get("duration_mpd_timescale")
+        if isinstance(duration, (int, float)) and duration > 0:
+            durations.append(int(duration))
+
+    if not durations:
+        return None
+    return int(statistics.median_low(durations))
 
 
 def preprocess_timeline(
@@ -379,14 +506,14 @@ def preprocess_timeline(
         for _ in range(repeat + 1):
             segment_start_time = period_start + timedelta(seconds=(start_time - presentation_time_offset) / timescale)
             segment_end_time = segment_start_time + timedelta(seconds=duration / timescale)
-            presentation_time = start_time - presentation_time_offset
             processed_data.append(
                 {
                     "number": start_number,
                     "start_time": segment_start_time,
                     "end_time": segment_end_time,
                     "duration": duration,
-                    "time": presentation_time,
+                    "time": start_time,
+                    "duration_mpd_timescale": duration,
                 }
             )
             start_time += duration
@@ -397,7 +524,9 @@ def preprocess_timeline(
     return processed_data
 
 
-def parse_segment_duration(parsed_dict: dict, item: dict, profile: dict, source: str, timescale: int) -> List[Dict]:
+def parse_segment_duration(
+    parsed_dict: dict, item: dict, profile: dict, mpd_url: str, timescale: int, base_url: str = ""
+) -> List[Dict]:
     """
     Parses segment duration and extracts segment information.
     This is used for static or live MPD manifests.
@@ -406,33 +535,50 @@ def parse_segment_duration(parsed_dict: dict, item: dict, profile: dict, source:
         parsed_dict (dict): The parsed MPD data.
         item (dict): The segment duration data.
         profile (dict): The profile information.
-        source (str): The source URL.
+        mpd_url (str): The URL of the MPD manifest.
         timescale (int): The timescale for the segments.
+        base_url (str): The BaseURL from the representation (optional, for per-representation paths).
 
     Returns:
         List[Dict]: The list of parsed segments.
     """
     duration = int(item["@duration"])
     start_number = int(item.get("@startNumber", 1))
+    presentation_time_offset = int(item.get("@presentationTimeOffset", 0))
     segment_duration_sec = duration / timescale
 
     if parsed_dict["isLive"]:
-        segments = generate_live_segments(parsed_dict, segment_duration_sec, start_number)
+        profile["nominal_duration_mpd_timescale"] = duration
+        segments = generate_live_segments(
+            parsed_dict,
+            segment_duration_sec,
+            start_number,
+            duration_mpd_timescale=duration,
+            presentation_time_offset=presentation_time_offset,
+        )
     else:
         segments = generate_vod_segments(profile, duration, timescale, start_number)
 
-    return [create_segment_data(seg, item, profile, source, timescale) for seg in segments]
+    return [create_segment_data(seg, item, profile, mpd_url, timescale, base_url) for seg in segments]
 
 
-def generate_live_segments(parsed_dict: dict, segment_duration_sec: float, start_number: int) -> List[Dict]:
+def generate_live_segments(
+    parsed_dict: dict,
+    segment_duration_sec: float,
+    start_number: int,
+    duration_mpd_timescale: Optional[int] = None,
+    presentation_time_offset: int = 0,
+) -> List[Dict]:
     """
     Generates live segments based on the segment duration and start number.
     This is used for live MPD manifests.
 
     Args:
         parsed_dict (dict): The parsed MPD data.
-        segment_duration_sec (float): The segment duration in seconds.
-        start_number (int): The starting segment number.
+        segment_duration_sec: The segment duration in seconds.
+        start_number: The starting segment number.
+        duration_mpd_timescale: Segment duration in MPD timescale units.
+        presentation_time_offset: MPD presentationTimeOffset, in timescale units.
 
     Returns:
         List[Dict]: The list of generated live segments.
@@ -447,15 +593,22 @@ def generate_live_segments(parsed_dict: dict, segment_duration_sec: float, start
         start_number,
     )
 
-    return [
-        {
+    segments = []
+    for number in range(earliest_segment_number, earliest_segment_number + segment_count):
+        start_time = parsed_dict["availabilityStartTime"] + timedelta(
+            seconds=(number - start_number) * segment_duration_sec
+        )
+        segment = {
             "number": number,
-            "start_time": parsed_dict["availabilityStartTime"]
-            + timedelta(seconds=(number - start_number) * segment_duration_sec),
-            "duration": segment_duration_sec,
+            "start_time": start_time,
+            "end_time": start_time + timedelta(seconds=segment_duration_sec),
+            "duration": duration_mpd_timescale if duration_mpd_timescale is not None else segment_duration_sec,
         }
-        for number in range(earliest_segment_number, earliest_segment_number + segment_count)
-    ]
+        if duration_mpd_timescale is not None:
+            segment["duration_mpd_timescale"] = duration_mpd_timescale
+            segment["time"] = presentation_time_offset + (number - start_number) * duration_mpd_timescale
+        segments.append(segment)
+    return segments
 
 
 def generate_vod_segments(profile: dict, duration: int, timescale: int, start_number: int) -> List[Dict]:
@@ -480,7 +633,9 @@ def generate_vod_segments(profile: dict, duration: int, timescale: int, start_nu
     return [{"number": start_number + i, "duration": duration / timescale} for i in range(segment_count)]
 
 
-def create_segment_data(segment: Dict, item: dict, profile: dict, source: str, timescale: Optional[int] = None) -> Dict:
+def create_segment_data(
+    segment: Dict, item: dict, profile: dict, mpd_url: str, timescale: Optional[int] = None, base_url: str = ""
+) -> Dict:
     """
     Creates segment data based on the segment information. This includes the segment URL and metadata.
 
@@ -488,23 +643,53 @@ def create_segment_data(segment: Dict, item: dict, profile: dict, source: str, t
         segment (Dict): The segment information.
         item (dict): The segment template data.
         profile (dict): The profile information.
-        source (str): The source URL.
+        mpd_url (str): The URL of the MPD manifest.
         timescale (int, optional): The timescale for the segments. Defaults to None.
+        base_url (str): The BaseURL from the representation (optional, for per-representation paths).
 
     Returns:
         Dict: The created segment data.
     """
     media_template = item["@media"]
-    media = media_template.replace("$RepresentationID$", profile["id"])
+    media = media_template.replace("$RepresentationID$", profile.get("rep_id", profile["id"]))
     media = media.replace("$Number%04d$", f"{segment['number']:04d}")
     media = media.replace("$Number$", str(segment["number"]))
     media = media.replace("$Bandwidth$", str(profile["bandwidth"]))
 
-    if "time" in segment and timescale is not None:
-        media = media.replace("$Time$", str(int(segment["time"])))
+    if "$Time$" in media and timescale is not None:
+        time_value = None
+        if "time" in segment:
+            time_value = int(segment["time"])
+        else:
+            duration_mpd_timescale = segment.get("duration_mpd_timescale")
+            if duration_mpd_timescale is None:
+                try:
+                    duration_mpd_timescale = int(item.get("@duration", 0))
+                except (TypeError, ValueError):
+                    duration_mpd_timescale = 0
+            if duration_mpd_timescale:
+                try:
+                    start_number = int(item.get("@startNumber", profile.get("segment_template_start_number", 1)))
+                except (TypeError, ValueError):
+                    start_number = profile.get("segment_template_start_number", 1)
+                try:
+                    presentation_time_offset = int(item.get("@presentationTimeOffset", 0))
+                except (TypeError, ValueError):
+                    presentation_time_offset = 0
+                time_value = presentation_time_offset + (int(segment["number"]) - start_number) * int(
+                    duration_mpd_timescale
+                )
 
-    if not media.startswith("http"):
-        media = f"{source}/{media}"
+        if time_value is not None:
+            media = media.replace("$Time$", str(time_value))
+
+    if "$Time$" in media:
+        logger.warning("Unresolved $Time$ placeholder in segment URL template: %s", media_template)
+
+    # Combine base_url and media, then resolve against mpd_url
+    if base_url:
+        media = base_url + media
+    media = resolve_url(mpd_url, media)
 
     segment_data = {
         "type": "segment",
@@ -515,7 +700,9 @@ def create_segment_data(segment: Dict, item: dict, profile: dict, source: str, t
     # Add time and duration metadata for adaptive sequence calculation
     if "time" in segment:
         segment_data["time"] = segment["time"]
-    if "duration" in segment:
+    if "duration_mpd_timescale" in segment:
+        segment_data["duration_mpd_timescale"] = segment["duration_mpd_timescale"]
+    elif "time" in segment and "duration" in segment and timescale is not None:
         segment_data["duration_mpd_timescale"] = segment["duration"]
 
     if "start_time" in segment and "end_time" in segment:
@@ -528,7 +715,14 @@ def create_segment_data(segment: Dict, item: dict, profile: dict, source: str, t
             }
         )
     elif "start_time" in segment and "duration" in segment:
-        duration_seconds = segment["duration"] / timescale
+        duration_mpd_timescale = segment.get("duration_mpd_timescale")
+        if duration_mpd_timescale is not None and timescale:
+            duration_seconds = duration_mpd_timescale / timescale
+        elif "time" in segment and timescale:
+            # Timeline-based segments store duration in MPD timescale units.
+            duration_seconds = segment["duration"] / timescale
+        else:
+            duration_seconds = segment["duration"]
         segment_data.update(
             {
                 "start_time": segment["start_time"],
@@ -537,45 +731,264 @@ def create_segment_data(segment: Dict, item: dict, profile: dict, source: str, t
                 "program_date_time": segment["start_time"].isoformat() + "Z",
             }
         )
-    elif "duration" in segment and timescale is not None:
-        # Convert duration from timescale units to seconds
-        segment_data["extinf"] = segment["duration"] / timescale
     elif "duration" in segment:
-        # If no timescale is provided, assume duration is already in seconds
+        # duration from generate_vod_segments and generate_live_segments is already in seconds
         segment_data["extinf"] = segment["duration"]
 
     return segment_data
 
 
-def parse_segment_base(representation: dict, profile: dict, source: str) -> List[Dict]:
+def parse_segment_list(
+    adaptation: dict, representation: dict, profile: dict, mpd_url: str, timescale: int
+) -> List[Dict]:
     """
-    Parses segment base information and extracts segment data. This is used for single-segment representations.
+    Parses SegmentList element with explicit SegmentURL entries.
+
+    SegmentList MPDs explicitly list each segment URL, unlike SegmentTemplate which uses
+    URL patterns. This is less common but used by some packagers.
 
     Args:
+        adaptation (dict): The adaptation set data.
         representation (dict): The representation data.
-        source (str): The source URL.
+        profile (dict): The profile information.
+        mpd_url (str): The URL of the MPD manifest.
+        timescale (int): The timescale for duration calculations.
 
     Returns:
         List[Dict]: The list of parsed segments.
     """
-    segment = representation["SegmentBase"]
-    start, end = map(int, segment["@indexRange"].split("-"))
-    if "Initialization" in segment:
-        start, _ = map(int, segment["Initialization"]["@range"].split("-"))
-    
-    # Set initUrl for SegmentBase
-    if not representation['BaseURL'].startswith("http"):
-        profile["initUrl"] = f"{source}/{representation['BaseURL']}"
-    else:
-        profile["initUrl"] = representation['BaseURL']
+    # SegmentList can be at AdaptationSet or Representation level
+    segment_list = representation.get("SegmentList") or adaptation.get("SegmentList", {})
+    segments = []
 
+    # Handle Initialization element
+    if "Initialization" in segment_list:
+        init_data = segment_list["Initialization"]
+        if "@sourceURL" in init_data:
+            init_url = init_data["@sourceURL"]
+            profile["initUrl"] = resolve_url(mpd_url, init_url)
+        elif "@range" in init_data:
+            # Initialization by byte range on the BaseURL
+            base_url = representation.get("BaseURL", "")
+            profile["initUrl"] = resolve_url(mpd_url, base_url)
+            profile["initRange"] = init_data["@range"]
+
+    # Get segment duration from SegmentList attributes
+    duration = int(segment_list.get("@duration", 0))
+    list_timescale = int(segment_list.get("@timescale", timescale or 1))
+    segment_duration_sec = duration / list_timescale if list_timescale else 0
+
+    # Parse SegmentURL elements
+    segment_urls = segment_list.get("SegmentURL", [])
+    if not isinstance(segment_urls, list):
+        segment_urls = [segment_urls]
+
+    for i, seg_url in enumerate(segment_urls):
+        if seg_url is None:
+            continue
+
+        # Get media URL - can be @media attribute or use BaseURL with @mediaRange
+        media_url = seg_url.get("@media", "")
+        media_range = seg_url.get("@mediaRange")
+
+        if media_url:
+            media_url = resolve_url(mpd_url, media_url)
+        else:
+            # Use BaseURL with byte range
+            base_url = representation.get("BaseURL", "")
+            media_url = resolve_url(mpd_url, base_url)
+
+        segment_data = {
+            "type": "segment",
+            "media": media_url,
+            "number": i + 1,
+            "extinf": segment_duration_sec if segment_duration_sec > 0 else 1.0,
+        }
+
+        # Include media range if specified
+        if media_range:
+            segment_data["mediaRange"] = media_range
+
+        segments.append(segment_data)
+
+    return segments
+
+
+def parse_segment_base(representation: dict, profile: dict, mpd_url: str) -> List[Dict]:
+    """
+    Parses segment base information and extracts segment data. This is used for single-segment representations
+    (SegmentBase MPDs, typically GPAC-generated on-demand profiles).
+
+    For SegmentBase, the entire media file is treated as a single segment. The initialization data
+    is specified by the Initialization element's range, and the segment index (SIDX) is at indexRange.
+
+    Args:
+        representation (dict): The representation data.
+        profile (dict): The profile information.
+        mpd_url (str): The URL of the MPD manifest.
+
+    Returns:
+        List[Dict]: The list of parsed segments.
+    """
+    segment = representation.get("SegmentBase", {})
+    base_url = representation.get("BaseURL", "")
+
+    # Build the full media URL
+    media_url = resolve_url(mpd_url, base_url)
+
+    # Set initUrl for SegmentBase - this is the URL with the initialization range
+    # The initialization segment contains codec/track info needed before playing media
+    profile["initUrl"] = media_url
+
+    # For SegmentBase, we need to specify byte ranges for init and media segments
+    init_range = None
+    if "Initialization" in segment:
+        init_range = segment["Initialization"].get("@range")
+
+    # Store initialization range in profile for segment endpoint to use
+    if init_range:
+        profile["initRange"] = init_range
+
+    # Get the index range which points to SIDX box
+    index_range = segment.get("@indexRange", "")
+
+    # Calculate total duration from profile's mediaPresentationDuration
+    total_duration = profile.get("mediaPresentationDuration")
+    if isinstance(total_duration, str):
+        total_duration = parse_duration(total_duration)
+    elif total_duration is None:
+        total_duration = 0
+
+    # Derive the media byte range: media data starts immediately after the init segment.
+    # init_range is "start-end" (e.g. "0-657"), so media begins at end+1.
+    # Without this, the proxy tries to download the whole file which causes CDN timeouts.
+    media_range = None
+    if init_range:
+        try:
+            end_byte = int(init_range.split("-")[1])
+            media_range = f"{end_byte + 1}-"
+        except (ValueError, IndexError):
+            pass
+
+    # For SegmentBase, we return a single segment representing the entire media
+    # The media URL is the same as initUrl but will be accessed with different byte ranges
     return [
         {
             "type": "segment",
-            "range": f"{start}-{end}",
-            "media": f"{source}/{representation['BaseURL']}",
+            "media": media_url,
+            "number": 1,
+            "extinf": total_duration if total_duration > 0 else 1.0,
+            "indexRange": index_range,
+            "initRange": init_range,
+            "mediaRange": media_range,
         }
     ]
+
+
+def parse_sidx_fragments(sidx_bytes: bytes, index_range_start: int) -> List[Dict]:
+    """
+    Parse a SIDX (Segment Index) box and return per-fragment byte ranges and durations.
+
+    The SIDX box lists subsegment sizes and durations so the player can seek directly
+    to any fragment without scanning the whole file.  We use this to generate one HLS
+    segment entry per fragment, enabling efficient seeking in SegmentBase MPDs.
+
+    Args:
+        sidx_bytes:        Raw bytes starting at index_range_start in the media file.
+                           May include other boxes (e.g. styp) before the sidx box.
+        index_range_start: Byte offset of sidx_bytes[0] within the media file.
+
+    Returns:
+        List of dicts, each with:
+            'start'               – first byte of fragment in media file (inclusive)
+            'end'                 – last byte of fragment in media file (inclusive)
+            'duration_timescale'  – subsegment duration in SIDX timescale units
+            'timescale'           – SIDX timescale (ticks per second)
+    """
+    # Scan forward to find the sidx box (may be preceded by styp or other boxes)
+    offset = 0
+    sidx_box_start = -1
+    while offset + 8 <= len(sidx_bytes):
+        box_size = struct.unpack_from(">I", sidx_bytes, offset)[0]
+        box_type = sidx_bytes[offset + 4 : offset + 8]
+        if box_type == b"sidx":
+            sidx_box_start = offset
+            break
+        if box_size < 8:
+            break
+        offset += box_size
+
+    if sidx_box_start < 0:
+        return []
+
+    sidx_file_start = index_range_start + sidx_box_start
+    sidx_size = struct.unpack_from(">I", sidx_bytes, sidx_box_start)[0]
+    sidx_file_end = sidx_file_start + sidx_size  # first byte AFTER the sidx box
+
+    off = sidx_box_start + 8  # skip box-size (4) + box-type (4)
+    if off >= len(sidx_bytes):
+        return []
+
+    version = sidx_bytes[off]
+    off += 4  # version (1) + flags (3)
+
+    off += 4  # reference_id (4)
+
+    if off + 4 > len(sidx_bytes):
+        return []
+    timescale = struct.unpack_from(">I", sidx_bytes, off)[0]
+    off += 4
+
+    if version == 0:
+        off += 4  # earliest_presentation_time (4)
+        if off + 4 > len(sidx_bytes):
+            return []
+        first_offset = struct.unpack_from(">I", sidx_bytes, off)[0]
+        off += 4
+    else:
+        off += 8  # earliest_presentation_time (8)
+        if off + 8 > len(sidx_bytes):
+            return []
+        first_offset = struct.unpack_from(">Q", sidx_bytes, off)[0]
+        off += 8
+
+    off += 2  # reserved (2)
+    if off + 2 > len(sidx_bytes):
+        return []
+    reference_count = struct.unpack_from(">H", sidx_bytes, off)[0]
+    off += 2
+
+    # First fragment starts immediately after SIDX + first_offset bytes of gap
+    frag_start = sidx_file_end + first_offset
+
+    fragments = []
+    for _ in range(reference_count):
+        if off + 12 > len(sidx_bytes):
+            break
+
+        ref_field = struct.unpack_from(">I", sidx_bytes, off)[0]
+        off += 4
+        ref_type = (ref_field >> 31) & 1
+        referenced_size = ref_field & 0x7FFF_FFFF
+
+        duration = struct.unpack_from(">I", sidx_bytes, off)[0]
+        off += 4
+
+        off += 4  # SAP field (ignored)
+
+        if ref_type == 0:  # media reference (not an index-of-indexes reference)
+            fragments.append(
+                {
+                    "start": frag_start,
+                    "end": frag_start + referenced_size - 1,
+                    "duration_timescale": duration,
+                    "timescale": timescale,
+                }
+            )
+
+        frag_start += referenced_size
+
+    return fragments
 
 
 def parse_duration(duration_str: str) -> float:

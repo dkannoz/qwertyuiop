@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import sys
+from contextlib import asynccontextmanager
 from importlib import resources
 
 from fastapi import FastAPI, Depends, Security, HTTPException
@@ -10,14 +12,71 @@ from starlette.staticfiles import StaticFiles
 
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.middleware import UIAccessControlMiddleware
-from mediaflow_proxy.routes import proxy_router, extractor_router, speedtest_router, playlist_builder_router
+from mediaflow_proxy.routes.proxy import proxy_router
+from mediaflow_proxy.routes.epg import epg_router
+from mediaflow_proxy.routes.extractor import extractor_router
+from mediaflow_proxy.routes.speedtest import speedtest_router
+from mediaflow_proxy.routes.playlist_builder import playlist_builder_router
+from mediaflow_proxy.routes.xtream import xtream_root_router
 from mediaflow_proxy.schemas import GenerateUrlRequest, GenerateMultiUrlRequest, MultiUrlRequestItem
 from mediaflow_proxy.utils.crypto_utils import EncryptionHandler, EncryptionMiddleware
+from mediaflow_proxy.utils import redis_utils
 from mediaflow_proxy.utils.http_utils import encode_mediaflow_proxy_url
 from mediaflow_proxy.utils.base64_utils import encode_url_to_base64, decode_base64_url, is_base64_url
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-app = FastAPI()
+logger = logging.getLogger(__name__)
+
+# Suppress Telethon's "RuntimeError: coroutine ignored GeneratorExit" warnings.
+# These are harmless GC noise from Telethon's internal _recv_loop coroutines
+# when parallel download connections are cleaned up after client disconnect.
+_default_unraisable_hook = sys.unraisablehook
+
+
+def _filtered_unraisable_hook(unraisable):
+    if isinstance(unraisable.exc_value, RuntimeError) and "coroutine ignored GeneratorExit" in str(
+        unraisable.exc_value
+    ):
+        return  # Suppress Telethon GC noise
+    _default_unraisable_hook(unraisable)
+
+
+sys.unraisablehook = _filtered_unraisable_hook
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler for startup and shutdown events."""
+    # Startup
+    if settings.clear_cache_on_startup:
+        logger.info("Clearing caches on startup (CLEAR_CACHE_ON_STARTUP=true)")
+        # Note: Redis cache clearing would require FLUSHDB which is too aggressive.
+        # Individual cache entries will expire via TTL. If full clear is needed,
+        # use redis-cli KEYS "mfp:*" | xargs redis-cli DEL
+        logger.info("Cache clearing note: Redis entries will expire via TTL")
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down...")
+    # Close acestream sessions
+    if settings.enable_acestream:
+        from mediaflow_proxy.utils.acestream import acestream_manager
+
+        await acestream_manager.close()
+        logger.info("Acestream manager closed")
+    # Close telegram session
+    if settings.enable_telegram:
+        from mediaflow_proxy.utils.telegram import telegram_manager
+
+        await telegram_manager.close()
+        logger.info("Telegram manager closed")
+    # Close Redis connections
+    await redis_utils.close_redis()
+    logger.info("Redis connections closed")
+
+
+app = FastAPI(lifespan=lifespan)
 api_password_query = APIKeyQuery(name="api_password", auto_error=False)
 api_password_header = APIKeyHeader(name="api_password", auto_error=False)
 app.add_middleware(
@@ -66,6 +125,11 @@ async def show_speedtest_page():
     return RedirectResponse(url="/speedtest.html")
 
 
+@app.get("/url-generator")
+async def show_url_generator_page():
+    return RedirectResponse(url="/url_generator.html")
+
+
 @app.post(
     "/generate_encrypted_or_encoded_url",
     description="Generate a single encoded URL",
@@ -112,6 +176,8 @@ async def generate_url(request: GenerateUrlRequest):
         query_params=query_params,
         request_headers=request.request_headers,
         response_headers=request.response_headers,
+        propagate_response_headers=request.propagate_response_headers,
+        remove_response_headers=request.remove_response_headers,
         encryption_handler=encryption_handler,
         expiration=request.expiration,
         ip=ip_str,
@@ -151,6 +217,8 @@ async def generate_urls(request: GenerateMultiUrlRequest):
             query_params=query_params,
             request_headers=url_item.request_headers,
             response_headers=url_item.response_headers,
+            propagate_response_headers=url_item.propagate_response_headers,
+            remove_response_headers=url_item.remove_response_headers,
             encryption_handler=encryption_handler,
             expiration=request.expiration,
             ip=ip_str,
@@ -171,10 +239,10 @@ async def generate_urls(request: GenerateMultiUrlRequest):
 async def encode_url_base64(url: str):
     """
     Encode a URL to base64 format.
-    
+
     Args:
         url (str): The URL to encode.
-        
+
     Returns:
         dict: A dictionary containing the encoded URL.
     """
@@ -194,17 +262,17 @@ async def encode_url_base64(url: str):
 async def decode_url_base64(encoded_url: str):
     """
     Decode a base64 encoded URL.
-    
+
     Args:
         encoded_url (str): The base64 encoded URL to decode.
-        
+
     Returns:
         dict: A dictionary containing the decoded URL.
     """
     decoded_url = decode_base64_url(encoded_url)
     if decoded_url is None:
         raise HTTPException(status_code=400, detail="Invalid base64 encoded URL")
-    
+
     return {"decoded_url": decoded_url, "encoded_url": encoded_url}
 
 
@@ -217,37 +285,50 @@ async def decode_url_base64(encoded_url: str):
 async def check_base64_url(url: str):
     """
     Check if a string appears to be a base64 encoded URL.
-    
+
     Args:
         url (str): The string to check.
-        
+
     Returns:
         dict: A dictionary indicating if the string is likely base64 encoded.
     """
     is_base64 = is_base64_url(url)
     result = {"url": url, "is_base64": is_base64}
-    
+
     if is_base64:
         decoded_url = decode_base64_url(url)
         if decoded_url:
             result["decoded_url"] = decoded_url
-    
+
     return result
 
 
 app.include_router(proxy_router, prefix="/proxy", tags=["proxy"], dependencies=[Depends(verify_api_key)])
+app.include_router(epg_router, prefix="/proxy", tags=["epg"], dependencies=[Depends(verify_api_key)])
+if settings.enable_acestream:
+    from mediaflow_proxy.routes.acestream import acestream_router
+
+    app.include_router(acestream_router, prefix="/proxy", tags=["acestream"], dependencies=[Depends(verify_api_key)])
+if settings.enable_telegram:
+    from mediaflow_proxy.routes.telegram import telegram_router
+
+    app.include_router(telegram_router, prefix="/proxy", tags=["telegram"], dependencies=[Depends(verify_api_key)])
 app.include_router(extractor_router, prefix="/extractor", tags=["extractors"], dependencies=[Depends(verify_api_key)])
 app.include_router(speedtest_router, prefix="/speedtest", tags=["speedtest"], dependencies=[Depends(verify_api_key)])
 app.include_router(playlist_builder_router, prefix="/playlist", tags=["playlist"])
+# Root-level XC endpoints for IPTV player compatibility (handles its own API key verification)
+app.include_router(xtream_root_router, tags=["xtream"])
 
 static_path = resources.files("mediaflow_proxy").joinpath("static")
 app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
 
 
 def run():
+    import os
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8888, log_level="info", workers=3)
+    port = int(os.environ.get("PORT", "8888"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", workers=3)
 
 
 if __name__ == "__main__":
