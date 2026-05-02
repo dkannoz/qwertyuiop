@@ -36,6 +36,7 @@ from mediaflow_proxy.utils.http_utils import (
     apply_header_manipulation,
 )
 from mediaflow_proxy.utils.stream_transformers import apply_transformer_to_bytes
+from mediaflow_proxy.utils.exoplayer_remux import remux_ts_for_exoplayer
 
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,10 @@ async def hls_segment_proxy(
             # Apply transformer if specified (e.g., PNG wrapper stripping)
             if transformer:
                 segment_data = await apply_transformer_to_bytes(segment_data, transformer)
+
+            # ExoPlayer remux: stream-copy TS segments to fix Vavoo PMT/audio quirks
+            if settings.exoplayer_remux and ext.lower() == "ts":
+                segment_data = await remux_ts_for_exoplayer(segment_data)
 
             # Return cached/downloaded segment
             base_headers = {

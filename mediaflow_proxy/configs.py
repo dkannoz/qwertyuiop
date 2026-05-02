@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     mpd_live_playlist_depth: int = 8  # Number of recent segments to expose per live playlist variant.
     remux_to_ts: bool = False  # Remux fMP4 segments to MPEG-TS for ExoPlayer/VLC compatibility.
     processed_segment_cache_ttl: int = 60  # TTL (seconds) for caching processed (decrypted/remuxed) segments.
+    exoplayer_remux: bool = False  # Stream-copy MPEG-TS segments to fix ExoPlayer audio decode (Vavoo et sim.).
 
     # Byparr settings — Firefox/Camoufox-based solver for Cloudflare bypass and chevy IP whitelist.
     # https://github.com/ThePhaseless/Byparr  (drop-in FlareSolverr-compatible API)
