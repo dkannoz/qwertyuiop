@@ -36,6 +36,8 @@ async def remux_ts_for_exoplayer(input_bytes: bytes) -> bytes:
         "-ar", "48000",
         "-ac", "2",
         "-b:a", "128k",
+        "-metadata:s:a:0", "language=ita",
+        "-mpegts_flags", "+resend_headers+pat_pmt_at_frames",
         "-f", "mpegts",
         "pipe:1",
     ]

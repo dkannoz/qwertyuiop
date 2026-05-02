@@ -302,11 +302,8 @@ async def hls_segment_proxy(
                 segment_data = await apply_transformer_to_bytes(segment_data, transformer)
 
             # ExoPlayer remux: stream-copy TS segments to fix Vavoo PMT/audio quirks
-            logger.info(f"[exo-remux] enabled={settings.exoplayer_remux} ext={ext}")
             if settings.exoplayer_remux and ext.lower() == "ts":
-                before = len(segment_data)
                 segment_data = await remux_ts_for_exoplayer(segment_data)
-                logger.info(f"[exo-remux] applied: {before} -> {len(segment_data)} bytes")
 
             # Return cached/downloaded segment
             base_headers = {
