@@ -196,6 +196,33 @@ async def hls_manifest_proxy(
         # Update request query params
         request._query_params = QueryParams(query_dict)
 
+    # ExoPlayer master-playlist wrapping: when enabled and the client did NOT
+    # already ask for the inner media playlist (`?_pl=1`), return a master
+    # playlist with explicit AUDIO/CODECS hints. This forces ExoPlayer to
+    # initialize the audio track up-front instead of relying on segment
+    # probing, which it does poorly for muxed AAC in MPEG-TS (Vavoo style).
+    inner_pl = request.query_params.get("_pl") == "1"
+    if settings.exoplayer_hls_master and not inner_pl:
+        from urllib.parse import urlencode
+        from starlette.responses import PlainTextResponse
+
+        # Build the inner media-playlist URL = same endpoint + _pl=1
+        inner_qs = dict(request.query_params)
+        inner_qs["_pl"] = "1"
+        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+        inner_url = f"{scheme}://{host}{request.url.path}?{urlencode(inner_qs)}"
+
+        master = (
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:5\n"
+            "#EXT-X-INDEPENDENT-SEGMENTS\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Italian\",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"ita\"\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.4d401f,mp4a.40.2\",AUDIO=\"aud\"\n"
+            f"{inner_url}\n"
+        )
+        return PlainTextResponse(content=master, media_type="application/vnd.apple.mpegurl")
+
     return await handle_hls_stream_proxy(request, hls_params, proxy_headers, hls_params.transformer)
 
 
