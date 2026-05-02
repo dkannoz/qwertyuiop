@@ -216,8 +216,9 @@ async def hls_manifest_proxy(
         master = (
             "#EXTM3U\n"
             "#EXT-X-VERSION:5\n"
+            "#EXT-X-INDEPENDENT-SEGMENTS\n"
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Italian\",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"ita\"\n"
-            "#EXT-X-STREAM-INF:BANDWIDTH=8000000,AVERAGE-BANDWIDTH=2500000,CODECS=\"avc1.4d401f,mp4a.40.2\",AUDIO=\"aud\"\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.4d401f,mp4a.40.2\",AUDIO=\"aud\"\n"
             f"{inner_url}\n"
         )
         return PlainTextResponse(content=master, media_type="application/vnd.apple.mpegurl")
