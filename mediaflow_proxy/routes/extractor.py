@@ -5,7 +5,6 @@ from typing import Annotated
 from fastapi import APIRouter, Query, HTTPException, Request, Depends, BackgroundTasks
 from fastapi.responses import RedirectResponse
 
-from mediaflow_proxy.configs import settings
 from mediaflow_proxy.extractors.base import ExtractorError
 from mediaflow_proxy.extractors.factory import ExtractorFactory
 from mediaflow_proxy.schemas import ExtractorURLParams
@@ -184,17 +183,6 @@ async def _extract_url_impl(
         # manifest processing. Redirect URL encoding expects it in query params.
         if response.pop("force_playlist_proxy", False):
             response["query_params"]["force_playlist_proxy"] = "1"
-
-        # ExoPlayer master-mode: for hosts whose CDN URLs expire fast (Vavoo),
-        # keep `destination_url` as the original input. handle_hls_stream_proxy
-        # will auto-resolve on every playlist fetch, so live signatures stay
-        # fresh across the player's 15s polls.
-        if (
-            settings.exoplayer_hls_master
-            and extractor_params.host.lower() == "vavoo"
-            and extractor_params.redirect_stream
-        ):
-            response["destination_url"] = extractor_params.destination
 
         if extractor_params.redirect_stream:
             encode_args = {

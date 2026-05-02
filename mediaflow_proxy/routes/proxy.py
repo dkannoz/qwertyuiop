@@ -221,7 +221,11 @@ async def hls_manifest_proxy(
             "#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.4d401f,mp4a.40.2\",AUDIO=\"aud\"\n"
             f"{inner_url}\n"
         )
-        return PlainTextResponse(content=master, media_type="application/vnd.apple.mpegurl")
+        return PlainTextResponse(
+            content=master,
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     return await handle_hls_stream_proxy(request, hls_params, proxy_headers, hls_params.transformer)
 
