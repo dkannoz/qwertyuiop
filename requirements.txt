@@ -25,3 +25,4 @@ aiohttp
 cloudscraper
 brotli
 aiohttp-socks
+redis>=5.0.0
